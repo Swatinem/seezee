@@ -1,0 +1,11 @@
+[package]
+name = "seezee"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+watto = "0.1.0"
+zstd = { version = "0.13.0", features = ["experimental"] }
+
+[dev-dependencies]
+proptest = "1.4.0"
