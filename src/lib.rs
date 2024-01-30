@@ -1,9 +1,11 @@
 use std::mem;
-use std::ops::Range;
+use std::ops::{Range, RangeBounds};
 
 use watto::Pod;
 
-const DEFAULT_FRAME_SIZE: usize = 8 * (1 << 10);
+mod zstd;
+
+const DEFAULT_FRAME_SIZE: usize = 32 * (1 << 10);
 
 pub struct Compressor {
     level: i32,
@@ -35,7 +37,7 @@ impl Compressor {
         assert!(input.len() < u32::MAX as usize);
 
         let num_frames = input.len().div_ceil(self.frame_size);
-        let mut compressor = zstd::bulk::Compressor::new(self.level)?;
+        let mut compressor = zstd::Compressor::new(self.level)?;
         compressor.include_checksum(false)?;
         compressor.include_contentsize(false)?;
         compressor.include_dictid(false)?;
@@ -43,7 +45,7 @@ impl Compressor {
 
         let table_sizeof = (num_frames + 3) * mem::size_of::<u32>();
 
-        let reserve = table_sizeof + zstd::zstd_safe::compress_bound(self.frame_size * 2);
+        let reserve = table_sizeof + zstd::compress_bound(self.frame_size * 2);
         let mut buf: Vec<u8> = Vec::with_capacity(reserve);
         buf.resize(table_sizeof, 0);
         set_u32(&mut buf, 0, self.frame_size as u32);
@@ -56,11 +58,10 @@ impl Compressor {
             let to = ((i + 1) * self.frame_size).min(input.len());
             let source = &input[from..to];
 
-            buf.reserve(zstd::zstd_safe::compress_bound(source.len()));
-            let destination: &mut [u8] = unsafe { mem::transmute(buf.spare_capacity_mut()) };
+            buf.reserve(zstd::compress_bound(source.len()));
+            let mut destination = zstd::SpareCapacityWriteBuf::new(&mut buf);
 
-            let bytes_written = compressor.compress_to_buffer(source, destination)?;
-            unsafe { buf.set_len(buf.len() + bytes_written) };
+            let bytes_written = compressor.compress_to_buffer(source, &mut destination)?;
 
             total_written += bytes_written;
             set_u32(&mut buf, i + 3, total_written as u32);
@@ -87,6 +88,7 @@ pub struct Decompressor<'b> {
     header: &'b Header,
     frame_offsets: &'b [u32],
     zstd_buf: &'b [u8],
+    read_buf: Vec<u8>,
 }
 
 #[repr(C)]
@@ -108,6 +110,7 @@ impl<'b> Decompressor<'b> {
             header,
             frame_offsets,
             zstd_buf,
+            read_buf: Vec::new(),
         })
     }
 
@@ -115,42 +118,94 @@ impl<'b> Decompressor<'b> {
         self.header.frame_size as usize
     }
 
-    pub fn read_into(&self, buf: &mut Vec<u8>, range: Range<usize>) -> std::io::Result<()> {
+    pub fn get<R>(&mut self, range: R) -> std::io::Result<Vec<u8>>
+    where
+        R: RangeBounds<usize>,
+    {
+        let mut buf = Vec::new();
+        self.get_into(&mut buf, range)?;
+        Ok(buf)
+    }
+
+    pub fn get_into<'o, R>(&mut self, buf: &'o mut Vec<u8>, range: R) -> std::io::Result<&'o [u8]>
+    where
+        R: RangeBounds<usize>,
+    {
+        let range = make_range(range, self.header.input_len as usize);
+        self.read_into(buf, range)
+    }
+
+    fn read_into<'o>(
+        &mut self,
+        buf: &'o mut Vec<u8>,
+        range: Range<usize>,
+    ) -> std::io::Result<&'o [u8]> {
+        if range.start > range.end {
+            return Err(eof());
+        }
         let frame_size = self.frame_size();
         let start = range.start / frame_size;
-        let end = (range.end / frame_size) + 1;
+        let end = range.end.div_ceil(frame_size);
         let frame_offsets = self.frame_offsets.get(start..=end).ok_or_else(eof)?;
 
-        let mut decompressor = zstd::bulk::Decompressor::new()?;
+        let mut decompressor = zstd::Decompressor::new()?;
         decompressor.include_magicbytes(false)?;
 
         buf.clear();
+        buf.reserve(range.len());
 
+        // FIXME: a stable `array_windows` would be nice
         for (i, win) in frame_offsets.windows(2).enumerate() {
-            let [start, end] = win else { return Err(eof()) };
-            let source = self
+            let &[start, end] = win else {
+                return Err(eof());
+            };
+            let source = &self
                 .zstd_buf
-                .get((*start as usize)..(*end as usize))
+                .get((start as usize)..(end as usize))
                 .ok_or_else(eof)?;
 
-            buf.reserve(frame_size);
-            let destination: &mut [u8] = unsafe { mem::transmute(buf.spare_capacity_mut()) };
-            let bytes_written = decompressor.decompress_to_buffer(source, destination)?;
-            unsafe { buf.set_len(buf.len() + bytes_written) };
+            let is_end = i == frame_offsets.len() - 2;
+            if i == 0 || is_end {
+                self.read_buf.clear();
+                self.read_buf.reserve(frame_size);
+                let mut destination = zstd::SpareCapacityWriteBuf::new(&mut self.read_buf);
+                decompressor.decompress_to_buffer(source, &mut destination)?;
 
-            if i == 0 {
-                buf.drain(..range.start % frame_size);
+                let start = if i == 0 { range.start % frame_size } else { 0 };
+                let end = (start + (range.len() - buf.len())).min(self.read_buf.len());
+                buf.extend_from_slice(&self.read_buf[start..end]);
+            } else {
+                let mut destination = zstd::SpareCapacityWriteBuf::new(buf);
+                let _bytes_written = decompressor.decompress_to_buffer(source, &mut destination)?;
             }
         }
 
-        buf.truncate(range.len());
-
-        Ok(())
+        Ok(buf.as_slice())
     }
 }
 
 fn eof() -> std::io::Error {
     std::io::ErrorKind::UnexpectedEof.into()
+}
+
+fn make_range<R>(range: R, len: usize) -> Range<usize>
+where
+    R: RangeBounds<usize>,
+{
+    use std::ops::Bound::*;
+
+    let start = match range.start_bound() {
+        Included(b) => *b,
+        Excluded(b) => *b,
+        Unbounded => 0,
+    };
+    let end = match range.end_bound() {
+        Included(b) => *b + 1,
+        Excluded(b) => *b,
+        Unbounded => len,
+    };
+
+    start..end
 }
 
 #[cfg(test)]
@@ -160,14 +215,27 @@ mod tests {
 
     #[test]
     fn test_compress() {
-        let input: Vec<u8> = (0..255).collect();
-        let compressed = Compressor::new().frame_size(128).compress(&input).unwrap();
+        let input: Vec<u8> = (0..32).collect();
+        let compressed = Compressor::new().frame_size(16).compress(&input).unwrap();
 
-        let mut output = Vec::new();
-        let decompressor = Decompressor::new(&compressed).unwrap();
-        decompressor.read_into(&mut output, 0..255).unwrap();
+        let mut o = Vec::new();
+        let mut d = Decompressor::new(&compressed).unwrap();
 
-        assert_eq!(&input[0..255], output);
+        #[allow(clippy::reversed_empty_ranges)]
+        {
+            assert_eq!(d.get_into(&mut o, 3..1).ok(), input.get(3..1));
+        }
+
+        assert_eq!(d.get_into(&mut o, ..0).ok(), input.get(..0));
+        assert_eq!(d.get_into(&mut o, ..).ok(), input.get(..));
+        assert_eq!(d.get_into(&mut o, 0..32).ok(), input.get(0..32));
+
+        assert_eq!(d.get_into(&mut o, ..31).ok(), input.get(..31));
+        assert_eq!(d.get_into(&mut o, 1..).ok(), input.get(1..));
+        assert_eq!(d.get_into(&mut o, 1..31).ok(), input.get(1..31));
+
+        assert_eq!(d.get_into(&mut o, 5..10).ok(), input.get(5..10));
+        assert_eq!(d.get_into(&mut o, 10..20).ok(), input.get(10..20));
     }
 
     proptest! {
@@ -180,13 +248,13 @@ mod tests {
             let compressed = Compressor::new().frame_size(frame_size).compress(&input).unwrap();
 
             let mut output = Vec::new();
-            let decompressor = Decompressor::new(&compressed).unwrap();
+            let mut decompressor = Decompressor::new(&compressed).unwrap();
 
             for (a,b) in ranges {
                 let (a, b) = (a.index(input.len()), b.index(input.len()));
                 let range = if a < b { a..b } else { b..a };
 
-                let output = decompressor.read_into(&mut output, range.clone()).ok().map(|_| &output[..]);
+                let output = decompressor.get_into(&mut output, range.clone()).ok();
 
                 prop_assert_eq!(input.get(range), output);
             }
