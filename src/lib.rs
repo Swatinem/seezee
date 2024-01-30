@@ -59,7 +59,7 @@ impl Compressor {
             let source = &input[from..to];
 
             buf.reserve(zstd::compress_bound(source.len()));
-            let mut destination = zstd::SpareCapacityWriteBuf::new(&mut buf);
+            let mut destination = zstd::spare_capacity_buf(&mut buf);
 
             let bytes_written = compressor.compress_to_buffer(source, &mut destination)?;
 
@@ -168,14 +168,14 @@ impl<'b> Decompressor<'b> {
             if i == 0 || is_end {
                 self.read_buf.clear();
                 self.read_buf.reserve(frame_size);
-                let mut destination = zstd::SpareCapacityWriteBuf::new(&mut self.read_buf);
+                let mut destination = zstd::spare_capacity_buf(&mut self.read_buf);
                 decompressor.decompress_to_buffer(source, &mut destination)?;
 
                 let start = if i == 0 { range.start % frame_size } else { 0 };
                 let end = (start + (range.len() - buf.len())).min(self.read_buf.len());
                 buf.extend_from_slice(&self.read_buf[start..end]);
             } else {
-                let mut destination = zstd::SpareCapacityWriteBuf::new(buf);
+                let mut destination = zstd::spare_capacity_buf(buf);
                 let _bytes_written = decompressor.decompress_to_buffer(source, &mut destination)?;
             }
         }
