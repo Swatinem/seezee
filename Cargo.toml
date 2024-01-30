@@ -1,7 +1,10 @@
 [package]
 name = "seezee"
+description = "A seekable `zstd` compressed buffer"
+authors = ["Arpad Borsos <swatinem@swatinem.de>"]
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
 
 [dependencies]
 watto = "0.1.0"
